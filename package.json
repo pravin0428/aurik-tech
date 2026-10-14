@@ -1,0 +1,38 @@
+{
+  "name": "aurik-tech",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Industrial equipment monitoring backend (Phase 5: canonical normalization + operational attention view)",
+  "main": "src/server.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "start:worker": "node src/worker/index.js",
+    "dev": "node --watch src/server.js",
+    "dev:worker": "node --watch src/worker/index.js",
+    "migrate": "node scripts/migrate.js",
+    "migrate:status": "node scripts/migrate.js status",
+    "seed": "node scripts/seed.js",
+    "seed:events": "node scripts/seed.js --events",
+    "test": "jest --runInBand",
+    "test:unit": "jest tests/unit --runInBand",
+    "test:integration": "jest tests/integration --runInBand"
+  },
+  "keywords": [],
+  "license": "UNLICENSED",
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "pg": "^8.13.1",
+    "pino": "^9.5.0",
+    "pino-http": "^10.3.0",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "pino-pretty": "^13.0.0",
+    "supertest": "^7.0.0"
+  }
+}

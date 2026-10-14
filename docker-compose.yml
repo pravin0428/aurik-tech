@@ -1,0 +1,97 @@
+name: aurik-tech
+
+# Local development stack: PostgreSQL, a one-shot migration runner, the API,
+# and the worker. Credentials below are local-development placeholders and can
+# be overridden via the environment or a local .env file. No real secrets here.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-aurik}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-aurik}
+      POSTGRES_DB: ${POSTGRES_DB:-aurik}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-aurik} -d ${POSTGRES_DB:-aurik}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  migrate:
+    build: .
+    command: ["node", "scripts/migrate.js"]
+    environment:
+      NODE_ENV: production
+      SERVICE_NAME: aurik-tech-migrate
+      DATABASE_URL: postgres://${POSTGRES_USER:-aurik}:${POSTGRES_PASSWORD:-aurik}@postgres:5432/${POSTGRES_DB:-aurik}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    build: .
+    command: ["node", "src/server.js"]
+    environment:
+      NODE_ENV: production
+      SERVICE_NAME: aurik-tech
+      HOST: 0.0.0.0
+      PORT: "3000"
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      LOG_PRETTY: "false"
+      INGESTION_AUTH_REQUIRED: ${INGESTION_AUTH_REQUIRED:-false}
+      INGESTION_API_KEYS: ${INGESTION_API_KEYS:-}
+      DATABASE_URL: postgres://${POSTGRES_USER:-aurik}:${POSTGRES_PASSWORD:-aurik}@postgres:5432/${POSTGRES_DB:-aurik}
+    ports:
+      - "${API_PORT:-3000}:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "require('http').get('http://127.0.0.1:3000/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  worker:
+    build: .
+    command: ["node", "src/worker/index.js"]
+    environment:
+      NODE_ENV: production
+      SERVICE_NAME: aurik-tech-worker
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      LOG_PRETTY: "false"
+      INGESTION_AUTH_REQUIRED: ${INGESTION_AUTH_REQUIRED:-false}
+      INGESTION_API_KEYS: ${INGESTION_API_KEYS:-}
+      WORKER_POLL_INTERVAL_MS: ${WORKER_POLL_INTERVAL_MS:-1000}
+      WORKER_BATCH_SIZE: ${WORKER_BATCH_SIZE:-10}
+      WORKER_RECOVERY_BATCH_SIZE: ${WORKER_RECOVERY_BATCH_SIZE:-10}
+      WORKER_MAX_ATTEMPTS: ${WORKER_MAX_ATTEMPTS:-5}
+      WORKER_LEASE_MS: ${WORKER_LEASE_MS:-60000}
+      WORKER_BACKOFF_BASE_MS: ${WORKER_BACKOFF_BASE_MS:-1000}
+      WORKER_BACKOFF_MAX_MS: ${WORKER_BACKOFF_MAX_MS:-60000}
+      DATABASE_URL: postgres://${POSTGRES_USER:-aurik}:${POSTGRES_PASSWORD:-aurik}@postgres:5432/${POSTGRES_DB:-aurik}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  pgdata:

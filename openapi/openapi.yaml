@@ -1,0 +1,461 @@
+openapi: 3.0.3
+info:
+  title: aurik-tech Industrial Equipment Monitoring API
+  version: 1.0.0
+  description: |
+    Backend for ingesting multi-vendor industrial equipment data, normalizing it into a
+    canonical event store, and exposing an explainable operational attention view.
+
+    All success responses use the envelope `{ data, requestId }`. All error responses use
+    `{ error: { code, message, category, details? }, requestId }`.
+
+    Delivery is **at-least-once with idempotent effects** (never exactly-once). Ingestion is
+    idempotent per `(vendor, idempotency key)`; normalization is idempotent via a deterministic
+    content fingerprint.
+servers:
+  - url: http://localhost:3000
+    description: Local development
+
+tags:
+  - name: Infrastructure
+  - name: Ingestion
+  - name: Operations
+
+paths:
+  /health:
+    get:
+      tags: [Infrastructure]
+      summary: Liveness probe
+      description: Process is up and serving. Does not touch the database.
+      operationId: getHealth
+      responses:
+        '200':
+          description: Service is alive
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        required: [status, service, uptimeSeconds, timestamp]
+                        properties:
+                          status: { type: string, example: ok }
+                          service: { type: string, example: aurik-tech }
+                          uptimeSeconds: { type: integer, example: 42 }
+                          timestamp: { type: string, format: date-time }
+
+  /ready:
+    get:
+      tags: [Infrastructure]
+      summary: Readiness probe
+      description: Reports whether the service can do useful work (database reachable). 503 if not.
+      operationId: getReady
+      responses:
+        '200':
+          description: Ready
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          status: { type: string, example: ready }
+                          checks:
+                            type: object
+                            properties:
+                              database: { type: string, example: ok }
+        '503':
+          description: Not ready (database unavailable)
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        properties:
+                          status: { type: string, example: not_ready }
+                          checks:
+                            type: object
+                            properties:
+                              database: { type: string, example: unavailable }
+
+  /api/v1/ingestion/{vendor}/submissions:
+    post:
+      tags: [Ingestion]
+      summary: Accept a vendor submission
+      description: |
+        Validates the envelope, durably stores the submission, and enqueues one processing job
+        (transactional). Returns 201 for a new submission and 200 for an idempotent replay.
+
+        Idempotency: identified by `(vendor, idempotency key)`. The key comes from the
+        `Idempotency-Key` header if present, otherwise the body's `submissionId`. Replay with an
+        equal payload → 200; the same key with a different payload → 409.
+      operationId: acceptSubmission
+      parameters:
+        - $ref: '#/components/parameters/Vendor'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IngestionEnvelope'
+      responses:
+        '201':
+          description: New submission accepted
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/SubmissionAccepted' }
+        '200':
+          description: Idempotent replay of an existing submission
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/SubmissionAccepted' }
+        '400':
+          description: Invalid body or missing idempotency key
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '401':
+          description: Missing or invalid vendor API key (when auth is enabled)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+        '409':
+          description: Idempotency key reused with a different payload
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  /api/v1/ingestion/submissions/{submissionId}:
+    get:
+      tags: [Ingestion]
+      summary: Get submission ingestion + processing status
+      description: Returns metadata only; never returns payload contents.
+      operationId: getSubmissionStatus
+      parameters:
+        - $ref: '#/components/parameters/SubmissionId'
+      responses:
+        '200':
+          description: Submission status
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/SubmissionStatus' }
+        '404':
+          description: Unknown submission
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  /api/v1/machines/{machineId}/status:
+    get:
+      tags: [Operations]
+      summary: Machine operational attention view
+      description: |
+        Latest derived operational status for one machine. A machine with no evidence is
+        `unknown` (never `ok`); evidence older than the stale window is `stale`.
+      operationId: getMachineStatus
+      parameters:
+        - $ref: '#/components/parameters/MachineId'
+      responses:
+        '200':
+          description: Machine status
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/MachineStatus' }
+        '404':
+          description: Unknown machine
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  /api/v1/plants/{plantId}/summary:
+    get:
+      tags: [Operations]
+      summary: Plant roll-up
+      operationId: getPlantSummary
+      parameters:
+        - $ref: '#/components/parameters/PlantId'
+      responses:
+        '200':
+          description: Plant summary
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/Summary' }
+        '404':
+          description: Unknown plant
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  /api/v1/lines/{lineId}/summary:
+    get:
+      tags: [Operations]
+      summary: Line roll-up
+      operationId: getLineSummary
+      parameters:
+        - $ref: '#/components/parameters/LineId'
+      responses:
+        '200':
+          description: Line summary
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/SuccessEnvelope'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/Summary' }
+        '404':
+          description: Unknown line
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+components:
+  parameters:
+    Vendor:
+      name: vendor
+      in: path
+      required: true
+      description: Vendor slug (case-insensitive).
+      schema:
+        type: string
+        enum: [pulseforge, thermexwatch, maintaflow]
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: Optional idempotency key; falls back to the body's `submissionId`.
+      schema:
+        type: string
+        maxLength: 255
+    SubmissionId:
+      name: submissionId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    MachineId:
+      name: machineId
+      in: path
+      required: true
+      schema: { type: string, example: EQ-002 }
+    PlantId:
+      name: plantId
+      in: path
+      required: true
+      schema: { type: string, example: PLANT_01 }
+    LineId:
+      name: lineId
+      in: path
+      required: true
+      schema: { type: string, example: LINE-A }
+
+  schemas:
+    SuccessEnvelope:
+      type: object
+      required: [data, requestId]
+      properties:
+        data: {}
+        requestId: { type: string }
+    ErrorEnvelope:
+      type: object
+      required: [error, requestId]
+      properties:
+        error:
+          type: object
+          required: [code, message, category]
+          properties:
+            code: { type: string, example: VALIDATION_ERROR }
+            message: { type: string }
+            category:
+              type: string
+              enum: [validation, authentication, authorization, not_found, conflict, database, processing, internal]
+            details:
+              type: array
+              items:
+                type: object
+                properties:
+                  path: { type: string }
+                  message: { type: string }
+        requestId: { type: string }
+
+    IngestionEnvelope:
+      type: object
+      required: [payload]
+      description: |
+        Minimal generic envelope. `payload` holds the opaque vendor data (object or array) and is
+        stored verbatim. Unknown top-level keys are rejected.
+      properties:
+        submissionId:
+          type: string
+          description: Optional idempotency key (used if the `Idempotency-Key` header is absent).
+        source:
+          type: object
+          description: Free-form source metadata.
+          additionalProperties: true
+        payload:
+          description: Vendor payload, stored verbatim for traceability/reprocessing.
+          oneOf:
+            - type: object
+            - type: array
+
+    SubmissionAccepted:
+      type: object
+      properties:
+        submissionId: { type: string, format: uuid }
+        vendor: { type: string }
+        status: { type: string, example: received }
+        processingStatus: { type: string, example: pending }
+        acceptedAt: { type: string, format: date-time }
+        idempotentReplay: { type: boolean }
+
+    SubmissionStatus:
+      type: object
+      properties:
+        submissionId: { type: string, format: uuid }
+        vendor: { type: string }
+        status: { type: string }
+        processingStatus: { type: string }
+        receivedAt: { type: string, format: date-time, nullable: true }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+        jobs:
+          type: array
+          items:
+            type: object
+            properties:
+              type: { type: string, example: normalize_submission }
+              status:
+                type: string
+                enum: [pending, processing, retrying, succeeded, dead_letter, blocked, failed, cancelled]
+              attempts: { type: integer }
+              maxAttempts: { type: integer }
+              availableAt: { type: string, format: date-time }
+
+    MachineStatus:
+      type: object
+      description: Canonical operational view for one machine.
+      properties:
+        machine_id: { type: string, example: EQ-002 }
+        plant_id: { type: string, example: PLANT_01 }
+        line_id: { type: string, example: LINE-A }
+        machine_type: { type: string, nullable: true }
+        criticality: { type: string, enum: [low, medium, high], nullable: true }
+        asset_status: { type: string, enum: [active, maintenance, unknown], nullable: true }
+        derived_status:
+          type: string
+          enum: [ok, warning, critical, recovering, stale, unknown]
+        attention_level:
+          type: string
+          enum: [none, low, medium, high, critical]
+        needs_attention: { type: boolean }
+        reason_codes:
+          type: array
+          items: { type: string }
+          example: [temperature_critical, maintenance_overdue, open_work_order]
+        latest_relevant_event_time: { type: string, format: date-time, nullable: true }
+        processing_status:
+          type: string
+          enum: [processed, partially_processed, failed, unknown]
+        source_event_refs:
+          type: array
+          items:
+            type: object
+            properties:
+              canonicalEventId: { type: string, format: uuid, nullable: true }
+              vendor: { type: string, nullable: true }
+              vendorEventId: { type: string, nullable: true }
+              submissionId: { type: string, format: uuid, nullable: true }
+              recordIndex: { type: integer, nullable: true }
+        last_processed_at: { type: string, format: date-time, nullable: true }
+        source_max_event_time: { type: string, format: date-time, nullable: true }
+        ratings:
+          type: object
+          properties:
+            rated_max_temp_c: { type: number, nullable: true }
+            rated_max_vibration_mm_s: { type: number, nullable: true }
+            baseline_power_kw: { type: number, nullable: true }
+
+    Summary:
+      type: object
+      properties:
+        scope: { type: string, enum: [plant, line] }
+        plant_id: { type: string, nullable: true }
+        line_id: { type: string, nullable: true }
+        machine_count: { type: integer }
+        by_status:
+          type: object
+          properties:
+            ok: { type: integer }
+            warning: { type: integer }
+            critical: { type: integer }
+            recovering: { type: integer }
+            stale: { type: integer }
+            unknown: { type: integer }
+        by_attention:
+          type: object
+          properties:
+            none: { type: integer }
+            low: { type: integer }
+            medium: { type: integer }
+            high: { type: integer }
+            critical: { type: integer }
+        needs_attention_count: { type: integer }
+        critical_machines:
+          type: array
+          items: { type: string }
+        machines_needing_attention:
+          type: array
+          items: { type: string }
+        lines_by_attention:
+          type: array
+          items:
+            type: object
+            properties:
+              line_id: { type: string }
+              machine_count: { type: integer }
+              needs_attention_count: { type: integer }
+              critical_count: { type: integer }
+        data_quality:
+          type: object
+          properties:
+            stale: { type: integer }
+            failed: { type: integer }
+            partially_processed: { type: integer }
+            never_processed: { type: integer }
